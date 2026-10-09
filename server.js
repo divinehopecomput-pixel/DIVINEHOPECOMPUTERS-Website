@@ -39,7 +39,20 @@ const pool = mysql.createPool({
 
 app.disable('x-powered-by');
 app.set('trust proxy', isProduction ? 1 : false);
-app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: { directives: {
+    defaultSrc: ["'self'"],
+    scriptSrc: ["'self'", "'unsafe-inline'"],
+    styleSrc: ["'self'", "'unsafe-inline'"],
+    imgSrc: ["'self'", 'https:', 'data:'],
+    connectSrc: ["'self'"],
+    objectSrc: ["'none'"],
+    baseUri: ["'self'"],
+    formAction: ["'self'", 'https://checkout.paystack.com'],
+    frameAncestors: ["'none'"]
+  } }
+}));
 const allowedOrigins = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use(cors({
   origin(origin, callback) {
@@ -324,7 +337,7 @@ app.get('/payment/callback', asyncRoute(async (req, res) => {
       signal: AbortSignal.timeout(15000)
     });
     const result = await response.json();
-    if (!response.ok || !result.status || !result.data) return res.status(502).send('Unable to verify payment. Contact the store before paying again.');
+    if (!response.ok || !result.status || !result.data || result.data.reference !== reference) return res.status(502).send('Unable to verify payment. Contact the store before paying again.');
     const data = result.data;
     const paid = await markOrderPaid(reference, data.amount, data.currency, data.status);
     if (paid) return res.redirect('/?payment=success&reference=' + encodeURIComponent(reference));
