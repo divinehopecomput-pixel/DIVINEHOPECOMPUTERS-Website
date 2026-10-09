@@ -266,14 +266,14 @@ app.post('/api/orders', asyncRoute(async (req, res) => {
     });
     const data = await response.json();
     if (!response.ok || !data.status || !data.data || !data.data.authorization_url) {
-      await pool.execute('UPDATE orders SET status=\'payment_failed\' WHERE public_reference=? AND status=\'pending_payment\'', [reference]);
+      await releaseOrderReservation(reference, 'payment_failed');
       console.error('Paystack initialize rejected:', data.message || response.status);
       return res.status(502).json({ error: 'Unable to start payment. Please try again.' });
     }
     await pool.execute('UPDATE orders SET payment_reference=? WHERE public_reference=?', [reference, reference]);
     res.status(201).json({ orderReference: reference, checkoutUrl: data.data.authorization_url });
   } catch (error) {
-    await pool.execute('UPDATE orders SET status=\'payment_failed\' WHERE public_reference=? AND status=\'pending_payment\'', [reference]);
+    await releaseOrderReservation(reference, 'payment_failed');
     console.error('Payment initialization failed:', error.message);
     res.status(502).json({ error: 'Payment provider is temporarily unavailable. Please try again.' });
   }
@@ -289,7 +289,7 @@ async function releaseOrderReservation(reference, finalStatus) {
     for (const item of items) {
       if (item.product_id) await conn.execute('UPDATE products SET stock_quantity=stock_quantity+? WHERE id=?', [item.quantity,item.product_id]);
     }
-    await conn.execute('UPDATE orders SET status=? WHERE id=? AND status=\\'pending_payment\\'', [finalStatus,orders[0].id]);
+    await conn.execute("UPDATE orders SET status=? WHERE id=? AND status='pending_payment'", [finalStatus,orders[0].id]);
     await conn.commit();
     return true;
   } catch (error) { await conn.rollback(); throw error; }
@@ -308,7 +308,7 @@ async function markOrderPaid(reference, amount, currency, status) {
     if (order.status === 'paid' || ['processing','shipped','completed'].includes(order.status)) { await conn.commit(); return true; }
     if (order.status !== 'pending_payment') { await conn.rollback(); return false; }
     // Stock was reserved in the order-creation transaction; do not deduct it twice.
-    await conn.execute('UPDATE orders SET status=\\'paid\\',paid_at=UTC_TIMESTAMP() WHERE id=?', [order.id]);
+    await conn.execute("UPDATE orders SET status='paid',paid_at=UTC_TIMESTAMP() WHERE id=?", [order.id]);
     await conn.commit();
     return true;
   } catch (error) { await conn.rollback(); throw error; }
