@@ -131,11 +131,11 @@ app.get('/api/products/:id', asyncRoute(async (req, res) => {
 app.post('/api/auth/login', asyncRoute(async (req, res) => {
   const email = cleanText(req.body.email, 254).toLowerCase();
   const password = typeof req.body.password === 'string' ? req.body.password : '';
-  if (!validEmail(email) || !password || !process.env.ADMIN_PASSWORD_HASH) return res.status(401).json({ error: 'Invalid email or password.' });
+  if (!validEmail(email) || !password) return res.status(401).json({ error: 'Invalid email or password.' });
   const [rows] = await pool.execute('SELECT id,email,password_hash FROM admins WHERE email=? LIMIT 1', [email]);
   const admin = rows[0];
   // A database admin row is required; ADMIN_PASSWORD_HASH is a bootstrap check only.
-  const hash = admin ? admin.password_hash : process.env.ADMIN_PASSWORD_HASH;
+  const hash = admin ? admin.password_hash : (process.env.ADMIN_PASSWORD_HASH || '$2a$12$invalidhashinvalidhashinvalidhashinvalidhashinvalidhashin');
   const matches = await bcrypt.compare(password, hash).catch(() => false);
   if (!admin || !matches) return res.status(401).json({ error: 'Invalid email or password.' });
   const token = jwt.sign({ sub: String(admin.id), email: admin.email, role: 'admin' }, process.env.JWT_SECRET, { algorithm: 'HS256', expiresIn: '2h', issuer: 'divine-hope-shop' });
@@ -226,6 +226,12 @@ app.post('/api/orders', asyncRoute(async (req, res) => {
       total += p.price_pesewas * qty;
       if (!Number.isSafeInteger(total) || total > 1000000000) { await conn.rollback(); return res.status(400).json({ error: 'Order total is too large.' }); }
     }
+    // Reserve stock atomically so concurrent customers cannot purchase the same final unit.
+    for (const p of products) {
+      const qty = quantities.get(Number(p.id));
+      const [reserved] = await conn.execute('UPDATE products SET stock_quantity=stock_quantity-? WHERE id=? AND active=1 AND stock_quantity>=?', [qty,p.id,qty]);
+      if (!reserved.affectedRows) { await conn.rollback(); return res.status(409).json({ error: 'Stock changed while checking out. Please refresh your cart.' }); }
+    }
     reference = crypto.randomUUID();
     const [result] = await conn.execute(
       'INSERT INTO orders (public_reference,customer_name,customer_email,customer_phone,shipping_address,notes,total_pesewas,status,payment_provider) VALUES (?,?,?,?,?,?,?,\'pending_payment\',\'paystack\')',
@@ -273,6 +279,23 @@ app.post('/api/orders', asyncRoute(async (req, res) => {
   }
 }));
 
+async function releaseOrderReservation(reference, finalStatus) {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [orders] = await conn.execute('SELECT id,status FROM orders WHERE public_reference=? FOR UPDATE', [reference]);
+    if (!orders.length || orders[0].status !== 'pending_payment') { await conn.rollback(); return false; }
+    const [items] = await conn.execute('SELECT product_id,quantity FROM order_items WHERE order_id=? FOR UPDATE', [orders[0].id]);
+    for (const item of items) {
+      if (item.product_id) await conn.execute('UPDATE products SET stock_quantity=stock_quantity+? WHERE id=?', [item.quantity,item.product_id]);
+    }
+    await conn.execute('UPDATE orders SET status=? WHERE id=? AND status=\\'pending_payment\\'', [finalStatus,orders[0].id]);
+    await conn.commit();
+    return true;
+  } catch (error) { await conn.rollback(); throw error; }
+  finally { conn.release(); }
+}
+
 async function markOrderPaid(reference, amount, currency, status) {
   if (!reference || status !== 'success' || currency !== 'GHS' || !Number.isSafeInteger(Number(amount))) return false;
   const conn = await pool.getConnection();
@@ -284,13 +307,8 @@ async function markOrderPaid(reference, amount, currency, status) {
     if (Number(order.total_pesewas) !== Number(amount)) { await conn.rollback(); console.error('Payment amount mismatch for order', order.id); return false; }
     if (order.status === 'paid' || ['processing','shipped','completed'].includes(order.status)) { await conn.commit(); return true; }
     if (order.status !== 'pending_payment') { await conn.rollback(); return false; }
-    const [items] = await conn.execute('SELECT product_id,quantity FROM order_items WHERE order_id=? FOR UPDATE', [order.id]);
-    for (const item of items) {
-      if (!item.product_id) { await conn.rollback(); return false; }
-      const [update] = await conn.execute('UPDATE products SET stock_quantity=stock_quantity-? WHERE id=? AND stock_quantity>=?', [item.quantity,item.product_id,item.quantity]);
-      if (!update.affectedRows) { await conn.rollback(); console.error('Stock conflict after payment for order', order.id); return false; }
-    }
-    await conn.execute('UPDATE orders SET status=\'paid\',paid_at=UTC_TIMESTAMP() WHERE id=?', [order.id]);
+    // Stock was reserved in the order-creation transaction; do not deduct it twice.
+    await conn.execute('UPDATE orders SET status=\\'paid\\',paid_at=UTC_TIMESTAMP() WHERE id=?', [order.id]);
     await conn.commit();
     return true;
   } catch (error) { await conn.rollback(); throw error; }
@@ -349,7 +367,16 @@ app.use((err, req, res, next) => {
   return res.status(500).json({ error: 'Unexpected server error.' });
 });
 
+// Release inventory reserved for abandoned unpaid checkouts after 30 minutes.
+const reservationCleanup = setInterval(async () => {
+  try {
+    const [expired] = await pool.query("SELECT public_reference FROM orders WHERE status='pending_payment' AND created_at < UTC_TIMESTAMP() - INTERVAL 30 MINUTE LIMIT 25");
+    for (const order of expired) await releaseOrderReservation(order.public_reference, 'cancelled');
+  } catch (error) { console.error('Reservation cleanup failed:', error.message); }
+}, 5 * 60 * 1000);
+if (typeof reservationCleanup.unref === 'function') reservationCleanup.unref();
+
 const server = app.listen(PORT, () => console.log('Divine Hope shop server listening on port ' + PORT));
-async function shutdown() { console.log('Shutting down...'); server.close(async () => { await pool.end(); process.exit(0); }); }
+async function shutdown() { console.log('Shutting down...'); clearInterval(reservationCleanup); server.close(async () => { await pool.end(); process.exit(0); }); }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
